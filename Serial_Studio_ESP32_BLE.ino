@@ -9,15 +9,15 @@
 #include "Gyro_QMI8658.h"
 
 // ------------------- 全局开关 -------------------
-#define IS_LEFT_SHOE
+//#define IS_LEFT_SHOE
 
 // ------------------- 差异化配置 -------------------
 #ifdef IS_LEFT_SHOE
   #define BLE_DEVICE_NAME     "A_Shoe_LEFT"
-  #define POS_BACK_BRAKE      3200
-  #define POS_BACK_RELEASE    3800
-  #define POS_FRONT_BRAKE     2800
-  #define POS_FRONT_RELEASE   1860
+  #define POS_BACK_BRAKE      1300
+  #define POS_BACK_RELEASE    2300
+  #define POS_FRONT_BRAKE     2200
+  #define POS_FRONT_RELEASE   1330
   // 左鞋自己的 Server UUID
   #define MY_SERVICE_UUID     "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
   #define MY_CHAR_UUID        "6E400003-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -26,11 +26,11 @@
   #define RIGHT_CHAR_UUID     "6E400013-B5A3-F393-E0A9-E50E24DCCA9E"
 #else
   #define BLE_DEVICE_NAME     "A_Shoe_RIGHT"
-  #define POS_BACK_BRAKE      2760
-  #define POS_BACK_RELEASE    3300
-  #define POS_FRONT_BRAKE     2950
-  #define POS_FRONT_RELEASE   1920
-  // 右鞋用不同的 UUID，避免左鞋 Client 误匹配自身s
+  #define POS_BACK_BRAKE      2800
+  #define POS_BACK_RELEASE    4000
+  #define POS_FRONT_BRAKE     2360
+  #define POS_FRONT_RELEASE   1600
+  // 右鞋用不同的 UUID，避免左鞋 Client 误匹配自身
   #define MY_SERVICE_UUID     "6E400011-B5A3-F393-E0A9-E50E24DCCA9E"
   #define MY_CHAR_UUID        "6E400013-B5A3-F393-E0A9-E50E24DCCA9E"
 #endif
@@ -51,12 +51,9 @@ volatile int cmdQueueTail = 0;
 // ==================== IMU 校准与滤波 ====================
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;  // 零偏
 
-const float FILTER_ALPHA = 0.08;  // 滤波系数，越小越稳
-
 // 陀螺仪静止校准（开机时调用，必须保持不动）
 void calibrateGyro() {
   float sumX = 0, sumY = 0, sumZ = 0;
-  // 连续读200次求平均
   for (int i = 0; i < 200; i++) {
     getAccelerometer();
     getGyroscope();
@@ -68,16 +65,15 @@ void calibrateGyro() {
   gyroOffsetX = sumX / 200;
   gyroOffsetY = sumY / 200;
   gyroOffsetZ = sumZ / 200;
-
   Serial.print("✅ 陀螺仪校准完成：");
-  Serial.print(gyroOffsetY);  // 你会看到这里输出 ~5.1 左右
+  Serial.print(gyroOffsetY);
   Serial.println(" °/s");
 }
 
 // 入队
 bool enqueueCmd(const String& cmd) {
   int next = (cmdQueueHead + 1) % CMD_QUEUE_SIZE;
-  if (next == cmdQueueTail) return false; // 队列满
+  if (next == cmdQueueTail) return false;
   cmdQueue[cmdQueueHead] = cmd;
   cmdQueueHead = next;
   return true;
@@ -91,8 +87,6 @@ bool dequeueCmd(String& cmd) {
   return true;
 }
 
-
-
 bool Flag_startDataTrans = false;
 
 // ======================= 舵机状态 ============================
@@ -104,10 +98,13 @@ HLSCL hlscl;
 unsigned long lastSendTime = 0;
 const long IMU_SEND_INTERVAL = 10;
 
-// ======================= 右鞋数据缓存 ========================
+// ======================= 右鞋数据缓存（增加转速） ========================
 #ifdef IS_LEFT_SHOE
-struct RightShoeData { float ax, ay, az, gx, gy, gz; };
-RightShoeData rightData = {0, 0, 0, 0, 0, 0};
+struct RightShoeData {
+  float ax, ay, az, gx, gy, gz;
+  float rpm;  // 新增：右鞋转速
+};
+RightShoeData rightData = {0, 0, 0, 0, 0, 0, 0};
 portMUX_TYPE rightDataMux = portMUX_INITIALIZER_UNLOCKED;
 String rightFrameBuffer = "";
 
@@ -117,21 +114,69 @@ void parseRightFrame(const String& frame) {
     if (start < 0 || end < 0 || end <= start) return;
 
     String body = frame.substring(start + 1, end);
-    float vals[6] = {0};
+    float vals[7] = {0};
     int idx = 0, from = 0;
-    for (int i = 0; i <= (int)body.length() && idx < 6; i++) {
+    for (int i = 0; i <= (int)body.length() && idx < 7; i++) {
         if (i == (int)body.length() || body[i] == ',') {
             vals[idx++] = body.substring(from, i).toFloat();
             from = i + 1;
         }
     }
-    if (idx < 6) return;
+    if (idx < 7) return;
 
     portENTER_CRITICAL(&rightDataMux);
-    rightData = {vals[0], vals[1], vals[2], vals[3], vals[4], vals[5]};
+    rightData.ax = vals[0];
+    rightData.ay = vals[1];
+    rightData.az = vals[2];
+    rightData.gx = vals[3];
+    rightData.gy = vals[4];
+    rightData.gz = vals[5];
+    rightData.rpm = vals[6];
     portEXIT_CRITICAL(&rightDataMux);
 }
 #endif
+
+// ======================= 霍尔传感器 测速 ============================
+int hall_din = 2;
+unsigned long lastHallTime = 0;
+float rpm = 0.0;  // 本机转速（左/右）
+int lastHallState = HIGH;
+int hallCnt = 0;
+const unsigned long DEBOUNCE_TIME = 300;
+unsigned long lastTriggerTime = 0;
+bool hallTriggered = false;
+
+
+void updateHallSpeed() {
+  int currentState = digitalRead(hall_din);
+  unsigned long now = millis();
+
+  if (!hallTriggered && currentState == LOW && lastHallState == HIGH && (now - lastTriggerTime) > DEBOUNCE_TIME) {
+    hallCnt++;
+    lastTriggerTime = now;
+    hallTriggered = true;
+
+    unsigned long interval = now - lastHallTime;
+    if (interval > 80 && interval < 5000) {
+      rpm = 60000.0 / interval;
+      if (rpm > 600 || rpm < 1) rpm = 0;
+    }
+    lastHallTime = now;
+    Serial.print("转速："); Serial.print(rpm, 1); Serial.println(" RPM");
+    Serial.print("触发次数："); Serial.println(hallCnt);
+    Serial.println(now);
+  }
+
+  if (currentState == HIGH) {
+    hallTriggered = false;
+  }
+
+  if (now - lastHallTime > 5000) {
+    rpm = 0;
+  }
+
+  lastHallState = currentState;
+}
 
 // ======================= 舵机控制 ============================
 void startServoMove(uint8_t id, uint16_t targetPos, bool keepTorque) {
@@ -181,11 +226,7 @@ class MyCallbacks : public BLECharacteristicCallbacks {
     void onWrite(BLECharacteristic* c) override {
         String cmd = c->getValue().c_str();
         cmd.trim();
-        //Serial.print("✅ 收到指令："); Serial.println(cmd);
-        // 直接入队，立刻返回
         enqueueCmd(cmd);
-
-
     }
 };
 
@@ -200,22 +241,12 @@ BLEAdvertisedDevice rightDevice;
 
 void notifyCallback(BLERemoteCharacteristic* pRC,
                     uint8_t* pData, size_t length, bool isNotify) {
-    // 打印收到的原始数据
-    //Serial.printf("📥 收到右鞋数据 长度=%d: ", length);
-    for (size_t i = 0; i < length; i++) Serial.print((char)pData[i]);
-    Serial.println();
-
     for (size_t i = 0; i < length; i++) rightFrameBuffer += (char)pData[i];
-
     int start = rightFrameBuffer.indexOf('$');
     int end   = rightFrameBuffer.indexOf(';');
 
-    Serial.printf("    buffer=%s start=%d end=%d\n",
-        rightFrameBuffer.c_str(), start, end);
-
     while (start >= 0 && end > start && end - start < 120) {
         String frame = rightFrameBuffer.substring(start, end + 1);
-        //Serial.print("    ✅ 解析帧: "); Serial.println(frame);
         parseRightFrame(frame);
         rightFrameBuffer = rightFrameBuffer.substring(end + 1);
         start = rightFrameBuffer.indexOf('$');
@@ -253,8 +284,7 @@ void connectRightShoe() {
     if (!pClient->connect(&rightDevice)) {
         Serial.println("❌ 右鞋连接失败"); return;
     }
-    pClient->setMTU(128);   // ⭐ 加这一句
-    // 用右鞋专属的 SERVICE UUID 查找，不会误匹配左鞋自身
+    pClient->setMTU(128);
     pRemoteService = pClient->getService(RIGHT_SERVICE_UUID);
     if (!pRemoteService) {
         Serial.println("❌ 右鞋服务未找到");
@@ -267,15 +297,7 @@ void connectRightShoe() {
     }
     if (pRemoteChar->canNotify()) {
         pRemoteChar->registerForNotify(notifyCallback);
-        Serial.println("✅ 已订阅右鞋 notify");
     }
-    if (pRemoteChar->canNotify()) {
-        pRemoteChar->registerForNotify(notifyCallback);  // 去掉 bool ok =
-        Serial.println("✅ 注册 notify 成功");
-    } else {
-        Serial.println("❌ 右鞋特征值不支持 notify");
-    }
-    // 连上立即让右鞋开始持续发送 IMU 数据
     sendCmdToRight("start_data");
     Serial.println("✅ 右鞋连接成功，已开始数据流");
 }
@@ -310,55 +332,52 @@ void release_front() { startServoMove(SERVO_FRONT_ID, POS_FRONT_RELEASE, false);
 void release_back()  { startServoMove(SERVO_BACK_ID,  POS_BACK_RELEASE,  false); }
 void release_all()   { release_front(); release_back(); }
 
-// ======================= BLE 发送 IMU 数据 ====================
+// ======================= BLE 发送数据 ====================
 void sendIMUviaBLE() {
-    // 诊断日志（确认后可删除）
-    static unsigned long lastLog = 0;
-    if (millis() - lastLog > 1000) {
-        lastLog = millis();
-        //Serial.printf("📊 connCount=%d flag=%d accel=(%.2f,%.2f,%.2f)\n",pServer->getConnectedCount(),Flag_startDataTrans,Accel.x, Accel.y, Accel.z);
-    }
-
     if (pServer->getConnectedCount() == 0) return;
     if (millis() - lastSendTime < IMU_SEND_INTERVAL) return;
     lastSendTime = millis();
-    static bool printed = false;
-    if (!printed) {
-        //Serial.printf("右鞋 MTU: %d\n", BLEDevice::getMTU());
-        printed = true;
-    }
 
     String data = "$";
+    // 1. 本机IMU（左/右）
     data += String(Accel.x, 2) + "," + String(Accel.y, 2) + "," + String(Accel.z, 2) + ",";
     data += String(Gyro.x,  2) + "," + String(Gyro.y,  2) + "," + String(Gyro.z,  2);
 
+    // 2. 本机转速（左/右）
+    data += "," + String(rpm, 1);
+
 #ifdef IS_LEFT_SHOE
-    float rax, ray, raz, rgx, rgy, rgz;
+    // 3. 右鞋IMU
+    float rax, ray, raz, rgx, rgy, rgz, r_rpm;
     if (rightShoeConnected) {
         portENTER_CRITICAL(&rightDataMux);
         rax = rightData.ax; ray = rightData.ay; raz = rightData.az;
         rgx = rightData.gx; rgy = rightData.gy; rgz = rightData.gz;
+        r_rpm = rightData.rpm;
         portEXIT_CRITICAL(&rightDataMux);
     } else {
-        rax = ray = raz = rgx = rgy = rgz = 0.0f;
+        rax = ray = raz = rgx = rgy = rgz = r_rpm = 0.0f;
     }
     data += "," + String(rax, 2) + "," + String(ray, 2) + "," + String(raz, 2) + ",";
     data += String(rgx, 2) + "," + String(rgy, 2) + "," + String(rgz, 2);
+
+    // 4. 右鞋转速
+    data += "," + String(r_rpm, 1);
 #endif
 
     data += ";\r\n";
-
-    // 打印发送内容（确认后可删除）
-    //Serial.print("📤 "); Serial.print(data);
-
-    int len = data.length();
     pChar->setValue(data.c_str());
     pChar->notify();
 }
+
 // ======================= 初始化 ==============================
 void setup() {
     Serial.begin(115200);
     delay(1000);
+
+    // 霍尔初始化
+    pinMode(hall_din, INPUT);
+    lastHallTime = millis();
 
     Serial1.begin(1000000, SERIAL_8N1, 11, 10);
     hlscl.pSerial = &Serial1;
@@ -366,10 +385,10 @@ void setup() {
 
     I2C_Init();
     QMI8658_Init();
-    calibrateGyro(); 
+    calibrateGyro();
 
     BLEDevice::init(BLE_DEVICE_NAME);
-    BLEDevice::setMTU(128);  // 协商大 MTU，减少分包
+    BLEDevice::setMTU(128);
 
     pServer = BLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
@@ -394,21 +413,19 @@ void setup() {
     hlscl.EnableTorque(SERVO_FRONT_ID, 0);
     hlscl.EnableTorque(SERVO_BACK_ID, 0);
     Serial.println("✅ 系统启动完成");
-    Serial.printf("实际 MTU: %d\n", BLEDevice::getMTU());
 }
 
 // ======================= 主循环 ==============================
 void loop() {
     updateServoState();
+    updateHallSpeed();
+
     getAccelerometer();
     getGyroscope();
     Gyro.x -= gyroOffsetX;
     Gyro.y -= gyroOffsetY;
     Gyro.z -= gyroOffsetZ;
-    
-    //Serial.printf("IMU Gyro : %.2f, %.2f, %.2f\r\n",Gyro.x, Gyro.y, Gyro.z);
-    Serial.printf("IMU Accel : %.2f, %.2f, %.2f\r\n",Accel.x, Accel.y, Accel.z);
-    // 从指令队列取出并执行（一次执行一条，不阻塞）
+
     String cmd;
     if (dequeueCmd(cmd)) {
         if (cmd == "brake")      brake_all();
@@ -424,10 +441,11 @@ void loop() {
         if (cmd == "brake"   || cmd == "release"   ||
             cmd == "brake_1" || cmd == "release_1" ||
             cmd == "brake_2" || cmd == "release_2") {
-            sendCmdToRight(cmd); 
+            sendCmdToRight(cmd);
         }
     #endif
     }
+
     if (Flag_startDataTrans) sendIMUviaBLE();
     delay(10);
 }
